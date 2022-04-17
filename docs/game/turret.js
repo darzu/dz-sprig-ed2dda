@@ -1,0 +1,136 @@
+import { EM } from "../entity-manager.js";
+import { quat, vec3 } from "../gl-matrix.js";
+import { PhysicsParentDef, PositionDef, RotationDef, } from "../physics/transform.js";
+import { ColliderDef } from "../physics/collider.js";
+import { AuthorityDef, SyncDef } from "../net/components.js";
+import { eventWizard } from "../net/events.js";
+import { InRangeDef, InteractableDef } from "./interact.js";
+import { LocalPlayerDef, PlayerDef } from "./player.js";
+import { CameraFollowDef, setCameraFollowPosition } from "../camera.js";
+import { copyAABB, createAABB } from "../physics/broadphase.js";
+import { InputsDef } from "../inputs.js";
+import { clamp } from "../math.js";
+import { DeletedDef } from "../delete.js";
+import { defineSerializableComponent } from "../em_helpers.js";
+export const YawPitchDef = defineSerializableComponent(EM, "yawpitch", (yaw, pitch) => {
+    return {
+        yaw: yaw !== null && yaw !== void 0 ? yaw : 0,
+        pitch: pitch !== null && pitch !== void 0 ? pitch : 0,
+    };
+}, (o, buf) => {
+    buf.writeFloat32(o.yaw);
+    buf.writeFloat32(o.pitch);
+}, (o, buf) => {
+    o.yaw = buf.readFloat32();
+    o.pitch = buf.readFloat32();
+});
+export const TurretDef = EM.defineComponent("turret", () => {
+    return {
+        mannedId: 0,
+        minYaw: -Math.PI * 0.5,
+        maxYaw: +Math.PI * 0.5,
+        minPitch: -Math.PI * 0.3,
+        maxPitch: Math.PI * 0.1,
+    };
+});
+export function constructNetTurret(e, startYaw, startPitch, meshAABB) {
+    EM.ensureComponentOn(e, YawPitchDef);
+    e.yawpitch.yaw = startYaw;
+    e.yawpitch.pitch = startPitch;
+    EM.ensureComponentOn(e, TurretDef);
+    e.turret.minYaw += startYaw;
+    e.turret.maxYaw += startYaw;
+    EM.ensureComponentOn(e, RotationDef);
+    EM.ensureComponentOn(e, SyncDef);
+    e.sync.dynamicComponents.push(YawPitchDef.id);
+    // setup camera params
+    EM.ensureComponentOn(e, CameraFollowDef, 0);
+    setCameraFollowPosition(e, "thirdPersonOverShoulder");
+    quat.rotateY(e.cameraFollow.rotationOffset, e.cameraFollow.rotationOffset, Math.PI / 2);
+    quat.rotateX(e.cameraFollow.rotationOffset, e.cameraFollow.rotationOffset, -Math.PI / 8);
+    // create seperate hitbox for interacting with the turret
+    const interactBox = EM.newEntity();
+    const interactAABB = copyAABB(createAABB(), meshAABB);
+    vec3.scale(interactAABB.min, interactAABB.min, 2);
+    vec3.scale(interactAABB.max, interactAABB.max, 2);
+    EM.ensureComponentOn(interactBox, PhysicsParentDef, e.id);
+    EM.ensureComponentOn(interactBox, PositionDef, [0, 0, 0]);
+    EM.ensureComponentOn(interactBox, ColliderDef, {
+        shape: "AABB",
+        solid: false,
+        aabb: interactAABB,
+    });
+    EM.ensureComponentOn(e, InteractableDef);
+    e.interaction.colliderId = interactBox.id;
+    return true;
+}
+export const raiseManTurret = eventWizard("man-turret", () => [
+    [PlayerDef, AuthorityDef],
+    [TurretDef, CameraFollowDef, AuthorityDef],
+], ([player, turret]) => {
+    const localPlayer = EM.getResource(LocalPlayerDef);
+    if ((localPlayer === null || localPlayer === void 0 ? void 0 : localPlayer.playerId) === player.id) {
+        turret.cameraFollow.priority = 2;
+        turret.authority.pid = player.authority.pid;
+        turret.authority.seq++;
+        turret.authority.updateSeq = 0;
+    }
+    player.player.manning = true;
+    turret.turret.mannedId = player.id;
+}, {
+    legalEvent: ([player, turret]) => {
+        return turret.turret.mannedId === 0;
+    },
+});
+export const raiseUnmanTurret = eventWizard("unman-turret", () => [[PlayerDef], [TurretDef, CameraFollowDef]], ([player, turret]) => {
+    turret.cameraFollow.priority = 0;
+    player.player.manning = false;
+    turret.turret.mannedId = 0;
+}, {
+    legalEvent: ([player, turret]) => {
+        return turret.turret.mannedId === player.id;
+    },
+});
+export function registerTurretSystems(em) {
+    em.registerSystem([TurretDef, RotationDef, YawPitchDef], [], (turrets, res) => {
+        for (let c of turrets) {
+            quat.copy(c.rotation, quat.IDENTITY);
+            quat.rotateY(c.rotation, c.rotation, c.yawpitch.yaw);
+            quat.rotateZ(c.rotation, c.rotation, c.yawpitch.pitch);
+        }
+    }, "turretYawPitch");
+    em.registerSystem([TurretDef, YawPitchDef], [InputsDef, LocalPlayerDef], (turrets, res) => {
+        const player = em.findEntity(res.localPlayer.playerId, [PlayerDef]);
+        if (!player)
+            return;
+        for (let c of turrets) {
+            if (DeletedDef.isOn(c))
+                continue;
+            if (c.turret.mannedId !== player.id)
+                continue;
+            c.yawpitch.yaw += -res.inputs.mouseMovX * 0.005;
+            c.yawpitch.yaw = clamp(c.yawpitch.yaw, c.turret.minYaw, c.turret.maxYaw);
+            c.yawpitch.pitch += res.inputs.mouseMovY * 0.002;
+            c.yawpitch.pitch = clamp(c.yawpitch.pitch, c.turret.minPitch, c.turret.maxPitch);
+        }
+    }, "turretAim");
+    em.registerSystem([TurretDef, InRangeDef, AuthorityDef, CameraFollowDef], [InputsDef, LocalPlayerDef], (turrets, res) => {
+        const player = em.findEntity(res.localPlayer.playerId, [
+            PlayerDef,
+            AuthorityDef,
+        ]);
+        if (!player)
+            return;
+        for (let c of turrets) {
+            if (DeletedDef.isOn(c))
+                continue;
+            if (res.inputs.keyClicks["e"]) {
+                if (c.turret.mannedId === player.id)
+                    raiseUnmanTurret(player, c);
+                if (c.turret.mannedId === 0)
+                    raiseManTurret(player, c);
+            }
+        }
+    }, "turretManUnman");
+}
+//# sourceMappingURL=turret.js.map
